@@ -6,7 +6,6 @@ import concurrent.futures
 import inspect
 
 # ----------------- Config -----------------
-DEBUG = False
 st.set_page_config(page_title="EC2 Capacity Block & SagMaker Training Plan Finder", layout="wide")
 st.header("🔎 EC2 Capacity Block & SagMaker Training Plan Finder")
 
@@ -39,14 +38,20 @@ st.markdown("""
 
 # ----------------- Constants -----------------
 INSTANCE_TYPES = [
-    "p6-b200.48xlarge","p5.4xlarge","p5.48xlarge","p5e.48xlarge","p5en.48xlarge",
-    "p4d.24xlarge","p4de.24xlarge","trn1.32xlarge","trn2.48xlarge"
+    "p6-b200.48xlarge",
+    "p5.4xlarge","p5.48xlarge","p5e.48xlarge","p5en.48xlarge",
+    "p4d.24xlarge","p4de.24xlarge",
+    "trn1.32xlarge","trn2.48xlarge"
 ]
 
 AWS_REGIONS = [
-    "us-east-1","us-east-2","us-west-1","us-west-2","eu-north-1","eu-west-1",
-    "eu-west-2","eu-central-1","ap-northeast-1","ap-south-1",
-    "ap-southeast-1","ap-southeast-2","sa-east-1"
+    "us-east-1","us-east-2",
+    "us-west-1","us-west-2",
+    "eu-north-1","eu-west-1","eu-west-2","eu-central-1",
+    "ap-northeast-1","ap-northeast-2",
+    "ap-south-1",
+    "ap-southeast-1","ap-southeast-2","ap-southeast-3", "ap-southeast-4",
+    "sa-east-1"
 ]
 
 VALID_DURATIONS = [1,2,3,4,5,6,7,8,9,10,11,12,13,14] + [i for i in range(21,183,7)]
