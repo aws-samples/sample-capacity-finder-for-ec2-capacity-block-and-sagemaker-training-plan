@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environments / secrets
+.env
+
+# Build & packaging
+build/
+dist/
+*.egg-info/
+
+# Logs & caches
+*.log
+.pytest_cache/
+.mypy_cache/
+
+# IDE / Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# AWS credentials & keys
+*.pem
+.aws/
