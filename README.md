@@ -23,8 +23,8 @@ Make sure you have:
 
 1. **Clone the repository**
    ```bash
-   git clone <sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan repo URL>
-   cd sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan
+   git clone <Repo URL>
+   cd <Repo folder>
    ```
 
 2. **Install dependencies**
