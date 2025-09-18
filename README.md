@@ -77,8 +77,3 @@ source venv/bin/activate
 ## License
 
 This project is licensed under the [MIT License](https://opensource.org/licenses/MIT).
-
-
-## Contributing
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
