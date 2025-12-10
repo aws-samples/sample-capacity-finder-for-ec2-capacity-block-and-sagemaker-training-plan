@@ -38,10 +38,10 @@ st.markdown("""
 
 # ----------------- Constants -----------------
 INSTANCE_TYPES = [
-    "p6-b200.48xlarge",
+    "p6-b200.48xlarge", "p6-b300.48xlarge", 
     "p5.4xlarge","p5.48xlarge","p5e.48xlarge","p5en.48xlarge",
     "p4d.24xlarge","p4de.24xlarge",
-    "trn1.32xlarge","trn2.48xlarge"
+    "trn1.32xlarge","trn2.48xlarge", "trn2.3xlarge"
 ]
 
 AWS_REGIONS = [
