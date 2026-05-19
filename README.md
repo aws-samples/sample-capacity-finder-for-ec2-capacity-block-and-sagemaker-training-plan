@@ -11,12 +11,14 @@
 
 ## Very Quick Start
 
-This is a single-file Streamlit app. Download `app.py` and run:
+This is a single-file Streamlit app. Run it directly with:
 ```bash
-   streamlit run app.py
+uvx --with boto3==1.40.18 --with pandas==2.3.2 --from streamlit==1.49.0 streamlit run https://raw.githubusercontent.com/aws-samples/sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan/main/app.py
 ```
-Make sure you have:
-- Python Dependencies (listed in [requirements.txt](requirements.txt)):  `streamlit`, `boto3`, `pandas`
+
+Prerequisites:
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed (provides the `uvx` command)
+- AWS credentials configured (e.g. `aws configure`, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars)
 - AWS IAM permissions: `ec2:DescribeCapacityBlockOfferings`, `sagemaker:SearchTrainingPlanOfferings`
 
 ## Quick Start
