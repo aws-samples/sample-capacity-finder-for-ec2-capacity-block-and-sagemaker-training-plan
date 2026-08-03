@@ -13,7 +13,7 @@
 
 This is a single-file Streamlit app. Run it directly with:
 ```bash
-uvx --with boto3==1.43.36 --with pandas==2.3.2 --from streamlit==1.54.0 streamlit run https://raw.githubusercontent.com/aws-samples/sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan/main/app.py
+uvx --with boto3==1.43.36 --with pandas==2.3.2 --with numpy==2.3.5 --with pyarrow==21.0.0 --from streamlit==1.54.0 streamlit run https://raw.githubusercontent.com/aws-samples/sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan/main/app.py
 ```
 
 Prerequisites:
