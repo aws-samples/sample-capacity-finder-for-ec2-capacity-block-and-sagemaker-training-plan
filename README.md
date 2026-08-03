@@ -19,7 +19,7 @@ uvx --with boto3==1.40.18 --with pandas==2.3.2 --from streamlit==1.49.0 streamli
 Prerequisites:
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed (provides the `uvx` command)
 - AWS credentials configured (e.g. `aws configure`, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars)
-- AWS IAM permissions: `ec2:DescribeCapacityBlockOfferings`, `sagemaker:SearchTrainingPlanOfferings`
+- AWS IAM permissions: `ec2:DescribeCapacityBlockOfferings`, `ec2:DescribeAvailabilityZones`, `sagemaker:SearchTrainingPlanOfferings`
 
 ## Quick Start
 
@@ -38,6 +38,7 @@ Prerequisites:
 
    The app requires the following AWS IAM permissions:
    - `ec2:DescribeCapacityBlockOfferings`
+   - `ec2:DescribeAvailabilityZones`
    - `sagemaker:SearchTrainingPlanOfferings`
 
    ```bash
@@ -68,6 +69,7 @@ source venv/bin/activate
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeCapacityBlockOfferings",
+        "ec2:DescribeAvailabilityZones",
         "sagemaker:SearchTrainingPlanOfferings"
       ],
       "Resource": "*"
