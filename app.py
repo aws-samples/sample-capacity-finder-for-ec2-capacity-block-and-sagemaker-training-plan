@@ -3,7 +3,12 @@ import boto3
 import pandas as pd
 import concurrent.futures
 import inspect
+import random
 import re
+import threading
+import time
+from botocore.config import Config
+from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 
 # ----------------- Config -----------------
@@ -74,7 +79,36 @@ SAGEMAKER_TARGET_RESOURCES = {
     "Endpoint (Inference)": "endpoint",
 }
 
+# Max regions scanned concurrently. Instance types are iterated sequentially
+# within each region so that only one describe call per region is in flight.
 MAX_WORKERS = 8
+
+# Error codes that mean "you are asking too fast". DescribeCapacityBlockOfferings
+# enforces a low, slowly-refilling limit per account per region and answers with
+# CapacityBlockDescribeLimitExceeded. botocore does not classify that code as
+# throttling (it is in neither ThrottledRetryableChecker._THROTTLED_ERROR_CODES
+# nor data/_retry.json), so no retry mode -- standard or adaptive -- backs off
+# for it. Pacing and retries are handled by RegionLimiter below instead.
+THROTTLE_ERROR_CODES = {
+    "CapacityBlockDescribeLimitExceeded",
+    "RequestLimitExceeded",
+    "Throttling",
+    "ThrottlingException",
+}
+
+# Standard mode still covers genuine 5xx and connection errors. Throttle backoff
+# is deliberately left to RegionLimiter so retries are paced per region rather
+# than per call.
+BOTO_CONFIG = Config(retries={"max_attempts": 3, "mode": "standard"})
+
+# Retry budget for a single throttled call. RETRY_BUDGET_SECONDS is a hard
+# ceiling on the total time one call may spend backing off, including time spent
+# waiting on the region's token bucket, so a saturated region cannot hold the
+# whole scan open. Regions are scanned in parallel, so this is not additive.
+RETRY_MAX_ATTEMPTS = 4
+RETRY_BASE_SECONDS = 2.0
+RETRY_CAP_SECONDS = 8.0
+RETRY_BUDGET_SECONDS = 30.0
 
 # ----------------- Helpers -----------------
 def log_msg(msg, region=None, instance_type=None):
@@ -132,6 +166,10 @@ def get_az_zone_id(az_name):
 
 def parse_error(full_error):
     """Turn a raw AWS error string into a short, friendly message"""
+    if "CapacityBlockDescribeLimitExceeded" in full_error:
+        return "Request rate limit exceeded — results may be incomplete, retry in a minute"
+    if any(code in full_error for code in ("RequestLimitExceeded", "ThrottlingException", "Throttling")):
+        return "Request rate limit exceeded — retry in a minute"
     if "AuthFailure" in full_error:
         return "Authentication failure — validate credentials and check the region is enabled"
     if "UnknownOperationException" in full_error and "not supported in the called region" in full_error:
@@ -212,10 +250,166 @@ selected_target_resource = st.sidebar.selectbox("SageMaker Target Resource", lis
 if use_end_date and start_date > end_date:
     st.sidebar.error("Start date must be before end date.")
 
+# ----------------- Rate Limiting -----------------
+class RegionLimiter:
+    """Token bucket for one service+region pair, with AIMD response to throttling.
+
+    Additive increase / multiplicative decrease: each success nudges the allowed
+    request rate up, each throttle halves it and empties the bucket. Draining the
+    bucket is what makes every worker touching that region slow down together,
+    rather than each one discovering the throttle for itself.
+    """
+
+    def __init__(self, rate=0.5, burst=2.0, min_rate=0.2, max_rate=1.0):
+        self._rate = rate
+        self._burst = burst
+        self._min_rate = min_rate
+        self._max_rate = max_rate
+        self._tokens = burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, max_wait=None):
+        """Block until a token is available, then consume it.
+
+        Returns True once a token is taken, or False if max_wait ran out first
+        (in which case nothing is consumed). The timeout keeps a penalised
+        limiter from stalling a Streamlit request indefinitely.
+        """
+        deadline = None if max_wait is None else time.monotonic() + max_wait
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last
+                self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+                self._last = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return True
+                wait = (1.0 - self._tokens) / self._rate
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wait = min(wait, remaining)
+            time.sleep(wait)
+
+    def penalize(self):
+        """Halve the rate and drain the bucket after a throttle."""
+        with self._lock:
+            self._rate = max(self._min_rate, self._rate * 0.5)
+            self._tokens = 0.0
+            return self._rate
+
+    def reward(self):
+        """Creep the rate back up after a success."""
+        with self._lock:
+            self._rate = min(self._max_rate, self._rate * 1.05)
+
+
+# Streamlit re-executes this script on every rerun, so module-level state is
+# discarded each time. Parking the registry in session_state lets a rate learned
+# during one scan carry over to the next click instead of resetting to optimistic.
+# The dict is fetched here, on the main thread, and passed to workers by
+# reference -- worker threads never touch session_state themselves.
+if "rate_limit_registry" not in st.session_state:
+    st.session_state["rate_limit_registry"] = {"limiters": {}, "lock": threading.Lock()}
+_LIMITERS = st.session_state["rate_limit_registry"]["limiters"]
+_LIMITERS_LOCK = st.session_state["rate_limit_registry"]["lock"]
+
+_client_lock = threading.Lock()
+
+
+def limiter_for(service, region):
+    """One limiter per service+region, since the quota is scoped that way."""
+    key = (service, region)
+    with _LIMITERS_LOCK:
+        if key not in _LIMITERS:
+            _LIMITERS[key] = RegionLimiter()
+        return _LIMITERS[key]
+
+
+def make_client(service, region):
+    """Build a client under a lock.
+
+    boto3 clients are thread-safe once constructed, but constructing them from
+    the shared default session concurrently is not.
+    """
+    with _client_lock:
+        return boto3.client(service, region_name=region, config=BOTO_CONFIG)
+
+
+def is_throttle_error(err):
+    """True if an exception or its stringified form is a throttling error."""
+    if isinstance(err, ClientError):
+        return err.response.get("Error", {}).get("Code", "") in THROTTLE_ERROR_CODES
+    return any(code in str(err) for code in THROTTLE_ERROR_CODES)
+
+
+def throttled_call(service, region, fn, itype=None):
+    """Run fn() paced by the region's limiter, retrying throttles with backoff.
+
+    Full jitter (uniform(0, delay)) rather than a fixed sleep: workers tend to
+    get throttled at the same moment, and fixed backoff just makes them retry in
+    lockstep. Raises the last ClientError if the attempt or time budget runs out.
+    """
+    limiter = limiter_for(service, region)
+    started = time.monotonic()
+    last_error = None
+    attempt = 0
+    while attempt < RETRY_MAX_ATTEMPTS:
+        remaining = RETRY_BUDGET_SECONDS - (time.monotonic() - started)
+        if remaining <= 0:
+            log_msg(f"throttle budget of {RETRY_BUDGET_SECONDS:.0f}s spent, giving up", region, itype)
+            break
+        if not limiter.acquire(max_wait=remaining):
+            log_msg("throttle budget spent waiting for a token, giving up", region, itype)
+            break
+        try:
+            result = fn()
+            limiter.reward()
+            return result
+        except ClientError as e:
+            if not is_throttle_error(e):
+                raise
+            last_error = e
+            attempt += 1
+            rate = limiter.penalize()
+            elapsed = time.monotonic() - started
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                log_msg(f"throttled, giving up after {attempt} attempt(s) in {elapsed:.1f}s", region, itype)
+                break
+            delay = random.uniform(0, min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))))
+            delay = min(delay, max(0.0, RETRY_BUDGET_SECONDS - elapsed))
+            log_msg(
+                f"throttled, rate now {rate:.2f}/s, retrying in {delay:.1f}s "
+                f"(attempt {attempt}/{RETRY_MAX_ATTEMPTS})",
+                region, itype)
+            time.sleep(delay)
+
+    if last_error is not None:
+        raise last_error
+    # Budget went entirely on waiting for a token, so the call never left the
+    # process. Report it as a throttle: it is one, just enforced locally after an
+    # earlier throttle penalised this region.
+    raise ClientError(
+        {"Error": {"Code": "CapacityBlockDescribeLimitExceeded",
+                   "Message": f"Local rate limiter held back the request to {region} "
+                              f"for {RETRY_BUDGET_SECONDS:.0f}s after earlier throttling"}},
+        "RateLimited")
+
+
+def was_throttled(results):
+    """True if any raw result row carries a throttling error."""
+    return any(
+        isinstance(r.get("Error"), str) and is_throttle_error(r["Error"])
+        for r in results
+    )
+
+
 # ----------------- AWS EC2 Scan -----------------
-def scan_region(region, itype, count, duration, fallback=False):
+def scan_region_instance_type(ec2, region, itype, count, duration):
     try:
-        ec2 = boto3.client("ec2", region_name=region)
         params = {
             "InstanceType": itype,
             "InstanceCount": int(count),
@@ -228,7 +422,10 @@ def scan_region(region, itype, count, duration, fallback=False):
             params["EndDateRange"] = datetime.combine(end_date, datetime.min.time())
         log_msg(f"EC2 params: {params}", region, itype)
 
-        resp = ec2.describe_capacity_block_offerings(**params)
+        resp = throttled_call(
+            "ec2", region,
+            lambda: ec2.describe_capacity_block_offerings(**params),
+            itype)
         offerings = resp.get("CapacityBlockOfferings", [])
         log_msg(f"EC2 offerings={len(offerings)}", region, itype)
         results = []
@@ -279,10 +476,39 @@ def scan_region(region, itype, count, duration, fallback=False):
         log_msg(f"scan_region error: {e}", region, itype)
         return [{"Region": region, "Error": str(e)}]
 
-# ----------------- SageMaker Scan -----------------
-def scan_sagemaker_region(region, itype, count, duration):
+
+def scan_region(region, instance_types, count, duration):
+    """Scan one region for every requested instance type, one call at a time.
+
+    Instance types are walked sequentially in this thread rather than fanned out,
+    so at most one DescribeCapacityBlockOfferings call per region is ever in
+    flight. The throttle is scoped per region, and parallelism across regions is
+    what actually saves wall-clock time.
+
+    A region that stays throttled after the full retry budget stops here: the
+    remaining instance types would each burn their own budget against a quota
+    that is clearly exhausted.
+    """
     try:
-        sm = boto3.client("sagemaker", region_name=region)
+        ec2 = make_client("ec2", region)
+    except Exception as e:
+        log_msg(f"client creation failed: {e}", region)
+        return [{"Region": region, "Error": str(e)}]
+
+    results = []
+    for itype in instance_types:
+        rows = scan_region_instance_type(ec2, region, itype, count, duration)
+        results.extend(rows)
+        if was_throttled(rows):
+            remaining = instance_types[instance_types.index(itype) + 1:]
+            if remaining:
+                log_msg(f"skipping {len(remaining)} remaining instance type(s)", region)
+            break
+    return results
+
+# ----------------- SageMaker Scan -----------------
+def scan_sagemaker_instance_type(sm, region, itype, count, duration):
+    try:
         params = {
             "TargetResources": [SAGEMAKER_TARGET_RESOURCES[selected_target_resource]],
             "InstanceType": f"ml.{itype}",
@@ -294,7 +520,10 @@ def scan_sagemaker_region(region, itype, count, duration):
             params["EndTimeBefore"] = datetime.combine(end_date, datetime.min.time())
         log_msg(f"SageMaker params: {params}", region, itype)
 
-        resp = sm.search_training_plan_offerings(**params)
+        resp = throttled_call(
+            "sagemaker", region,
+            lambda: sm.search_training_plan_offerings(**params),
+            itype)
         offerings = resp.get("TrainingPlanOfferings", [])
         log_msg(f"SageMaker offerings={len(offerings)}", region, itype)
         results = []
@@ -333,15 +562,45 @@ def scan_sagemaker_region(region, itype, count, duration):
         log_msg(f"scan_sagemaker error: {e}", region, itype)
         return [{"Region": region, "Error": str(e)}]
 
+
+def scan_sagemaker_region(region, instance_types, count, duration):
+    """SageMaker counterpart to scan_region: one region, types walked in order."""
+    try:
+        sm = make_client("sagemaker", region)
+    except Exception as e:
+        log_msg(f"client creation failed: {e}", region)
+        return [{"Region": region, "Error": str(e)}]
+
+    results = []
+    for itype in instance_types:
+        rows = scan_sagemaker_instance_type(sm, region, itype, count, duration)
+        results.extend(rows)
+        if was_throttled(rows):
+            remaining = instance_types[instance_types.index(itype) + 1:]
+            if remaining:
+                log_msg(f"skipping {len(remaining)} remaining instance type(s)", region)
+            break
+    return results
+
 # ----------------- Run Scans -----------------
 col1, col2, col3 = st.columns([1, 1, 4])
 with col1: do_capacity = st.button("Find EC2 Capacity Block")
 with col2: do_sagemaker = st.button("Find SageMaker Training Plan")
 
 def run_parallel(scan_fn, regions, instance_types, *args):
+    """Fan out one task per region.
+
+    Previously this submitted one task per (region, instance_type) pair, which
+    let all MAX_WORKERS threads pile onto a single region when several instance
+    types were selected -- the fastest way to trip a per-region quota. Each task
+    now owns a whole region and iterates instance types internally.
+    """
     results = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = [ex.submit(scan_fn, r, it, *args) for r in regions for it in instance_types]
+    if not regions or not instance_types:
+        return results
+    workers = min(MAX_WORKERS, len(regions))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(scan_fn, r, list(instance_types), *args) for r in regions]
         for f in concurrent.futures.as_completed(futures):
             results.extend(f.result())
     return results
@@ -352,17 +611,37 @@ if do_capacity:
     with st.spinner(f"Scanning {len(scan_regions)} region(s)..."):
         results = run_parallel(scan_region, scan_regions, selected_instance_types, instance_count, duration_days)
         success, errors = process_results(results, RESULT_COLS)
-        if success.empty:
+        throttled = was_throttled(results)
+        if success.empty and throttled:
+            # Never launch the reduced-parameter pass off the back of a throttle.
+            # It used to fire immediately, and against every region rather than
+            # the selected ones, which turned one rate limit into a sustained one.
+            st.error(
+                "🚦 Request rate limit reached before any offerings came back, so the "
+                "reduced-parameter retry was skipped to let the limit recover. "
+                "Wait a minute and search again, or narrow the regions and instance types."
+            )
+        elif success.empty:
             st.info("ℹ️ No capacity found. Retrying with reduced params...")
-            reduced = run_parallel(scan_region, AWS_REGIONS, selected_instance_types, max(1,instance_count//2), max(1,duration_days//2))
+            # Same regions the user selected. The rate limiters carry their learned
+            # rates over from the pass above, so this second wave stays paced.
+            reduced = run_parallel(scan_region, scan_regions, selected_instance_types, max(1,instance_count//2), max(1,duration_days//2))
             fallback, _ = process_results(reduced, RESULT_COLS)
             if not fallback.empty:
                 st.success("✅ Found alternatives with reduced parameters!")
                 st.dataframe(fallback, width='stretch', column_config=DATE_COL_CONFIG)
+            elif was_throttled(reduced):
+                st.error("🚦 Request rate limit reached during the reduced-parameter retry. Wait a minute and try again.")
             else:
                 st.warning("⚠️ No offerings found even with reduced parameters.")
         else:
-            st.success("✅ Capacity blocks found!")
+            if throttled:
+                st.warning(
+                    "🚦 Partial results: some regions hit the request rate limit, so "
+                    "offerings there may be missing. Search again in a minute for the full picture."
+                )
+            else:
+                st.success("✅ Capacity blocks found!")
             st.dataframe(success, width='stretch', column_config=DATE_COL_CONFIG)
         if not errors.empty:
             st.warning("⚠️ Some regions returned errors:")
@@ -374,10 +653,16 @@ if do_sagemaker:
     with st.spinner(f"Scanning SageMaker in {len(scan_regions)} region(s)..."):
         results = run_parallel(scan_sagemaker_region, scan_regions, selected_instance_types, instance_count, duration_days)
         success, errors = process_results(results, RESULT_COLS)
-        if success.empty:
+        throttled = was_throttled(results)
+        if success.empty and throttled:
+            st.error("🚦 Request rate limit reached. Wait a minute and search again, or narrow the regions and instance types.")
+        elif success.empty:
             st.info("ℹ️ No SageMaker offerings found.")
         else:
-            st.success("✅ SageMaker offerings found!")
+            if throttled:
+                st.warning("🚦 Partial results: some regions hit the request rate limit, so offerings there may be missing.")
+            else:
+                st.success("✅ SageMaker offerings found!")
             st.dataframe(success, width='stretch', column_config=DATE_COL_CONFIG)
         if not errors.empty:
             st.warning("⚠️ Some regions returned errors:")
