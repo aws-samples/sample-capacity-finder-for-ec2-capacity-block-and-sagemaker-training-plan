@@ -504,7 +504,11 @@ def throttled_call(service, region, fn, itype=None):
             if attempt >= RETRY_MAX_ATTEMPTS:
                 log_msg(f"throttled, giving up after {attempt} attempt(s) in {elapsed:.1f}s", region, itype)
                 break
-            delay = random.uniform(0, min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1))))
+            # Not a security decision: the jitter only decorrelates retry timing
+            # between workers, so the stdlib PRNG is the right tool. Flagged by
+            # bandit B311, which cannot tell a cryptographic use from this one.
+            ceiling = min(RETRY_CAP_SECONDS, RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+            delay = random.uniform(0, ceiling)  # nosec B311 # jitter, not cryptographic
             delay = min(delay, max(0.0, RETRY_BUDGET_SECONDS - elapsed))
             log_msg(
                 f"throttled, rate now {rate:.2f}/s, retrying in {delay:.1f}s "
