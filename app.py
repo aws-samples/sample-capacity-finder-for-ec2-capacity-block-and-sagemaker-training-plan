@@ -9,7 +9,8 @@ import threading
 import time
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+from typing import NamedTuple, Optional
 
 # ----------------- Config -----------------
 st.set_page_config(page_title="EC2 Capacity Block & SageMaker Training Plan Finder", layout="wide")
@@ -110,6 +111,39 @@ RETRY_BASE_SECONDS = 2.0
 RETRY_CAP_SECONDS = 8.0
 RETRY_BUDGET_SECONDS = 30.0
 
+# How long a completed scan may be replayed from cache, and how many distinct
+# searches to remember. Kept short on purpose: the aim is to absorb double
+# clicks and reruns, which is what actually burns the quota, without hiding
+# capacity that genuinely appeared since the last look. "Force fresh scan" in
+# the sidebar bypasses it for a deliberate re-check.
+SCAN_CACHE_TTL_SECONDS = 60
+SCAN_CACHE_MAX_ENTRIES = 32
+
+# ----------------- Session State -----------------
+# Streamlit re-executes this script from scratch on every rerun, so anything held
+# at module level is thrown away each time. State that must outlive a rerun --
+# learned request rates, clients, lookups, scan results -- goes in session_state.
+#
+# Each entry is read once here on the main thread and handed to worker threads by
+# reference, so no worker ever touches session_state itself (which would need a
+# ScriptRunContext it does not have).
+def _session_store(name, factory):
+    if name not in st.session_state:
+        st.session_state[name] = factory()
+    return st.session_state[name]
+
+
+_RATE_LIMITERS = _session_store("rate_limiters", dict)
+_RATE_LIMITERS_LOCK = _session_store("rate_limiters_lock", threading.Lock)
+
+_CLIENTS = _session_store("boto_clients", dict)
+_CLIENTS_LOCK = _session_store("boto_clients_lock", threading.Lock)
+
+_ZONE_IDS = _session_store("zone_ids_by_region", dict)
+_ZONE_IDS_LOCK = _session_store("zone_ids_lock", threading.Lock)
+
+_SCAN_CACHE = _session_store("scan_cache", dict)
+
 # ----------------- Helpers -----------------
 def log_msg(msg, region=None, instance_type=None):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -135,34 +169,60 @@ def fmt_date(dt):
         dt = dt.replace(tzinfo=None)
     return dt
 
-_az_zone_id_cache = {}
+def az_parent_region(az_name):
+    """Parent region of an AZ name.
+
+    Handles standard AZs (us-east-1a -> us-east-1) and Local Zones
+    (us-east-1-atl-2a -> us-east-1). Stripping the last character would wrongly
+    give 'us-east-1-atl-2' for a Local Zone.
+    """
+    m = re.match(r"^[a-z]{2}-[a-z]+-\d+", az_name)
+    return m.group(0) if m else az_name[:-1]
+
+
+def region_zone_ids(region):
+    """AZ name -> physical Zone ID for an entire region, fetched at most once.
+
+    This used to be a DescribeAvailabilityZones call per result row, each one
+    building its own client, so a region returning 40 rows made 40 calls. One
+    unfiltered call returns every AZ and Local Zone in the region instead.
+
+    Left off the RegionLimiter deliberately: the quota that was being tripped is
+    specific to DescribeCapacityBlockOfferings, and spending its tokens on zone
+    lookups would slow the actual scan. DescribeAvailabilityZones answers with
+    RequestLimitExceeded, which botocore does recognise, so BOTO_CONFIG's
+    standard retry mode already backs off for it.
+    """
+    with _ZONE_IDS_LOCK:
+        if region in _ZONE_IDS:
+            return _ZONE_IDS[region]
+    try:
+        resp = make_client("ec2", region).describe_availability_zones(AllAvailabilityZones=True)
+    except Exception as e:
+        # Not cached, so a later scan can try again rather than showing N/A for
+        # the rest of the session after one transient failure.
+        log_msg(f"zone ID lookup failed: {e}", region)
+        return {}
+    mapping = {}
+    for az in resp.get("AvailabilityZones", []):
+        name = az.get("ZoneName")
+        if not name:
+            continue
+        zone_id = az.get("ZoneId", "N/A")
+        if az.get("ZoneType") == "local-zone":
+            zone_id += " (Local Zone)"
+        mapping[name] = zone_id
+    log_msg(f"cached {len(mapping)} zone ID(s) in one call", region)
+    with _ZONE_IDS_LOCK:
+        _ZONE_IDS[region] = mapping
+    return mapping
+
 
 def get_az_zone_id(az_name):
     """Map AZ name (e.g. us-east-1a) to physical Zone ID (e.g. use1-az1)"""
     if not az_name or az_name == "N/A":
         return "N/A"
-    if az_name in _az_zone_id_cache:
-        return _az_zone_id_cache[az_name]
-    try:
-        # Parent region: handles standard AZs (us-east-1a -> us-east-1) AND
-        # Local Zones (us-east-1-atl-2a -> us-east-1). Stripping the last char
-        # would wrongly give 'us-east-1-atl-2' for Local Zones.
-        m = re.match(r"^[a-z]{2}-[a-z]+-\d+", az_name)
-        region = m.group(0) if m else az_name[:-1]
-        resp = boto3.client("ec2", region_name=region).describe_availability_zones(
-            ZoneNames=[az_name], AllAvailabilityZones=True)
-        azs = resp.get("AvailabilityZones", [])
-        if azs:
-            zone_id = azs[0]["ZoneId"]
-            if azs[0].get("ZoneType") == "local-zone":
-                zone_id += " (Local Zone)"
-        else:
-            zone_id = "N/A"
-        _az_zone_id_cache[az_name] = zone_id
-        return zone_id
-    except Exception:
-        _az_zone_id_cache[az_name] = "N/A"
-        return "N/A"
+    return region_zone_ids(az_parent_region(az_name)).get(az_name, "N/A")
 
 def parse_error(full_error):
     """Turn a raw AWS error string into a short, friendly message"""
@@ -197,6 +257,53 @@ def parse_error(full_error):
             return f"'{match.group(1)}' is not supported in this region"
         return "Instance type is not supported in this region"
     return ""
+
+class SearchParams(NamedTuple):
+    """Every input that changes what a scan returns, in one hashable value.
+
+    The scan functions used to read start_date, end_date and the SageMaker target
+    straight off module scope. Passing them explicitly is what makes a result
+    cache safe: the cache key can only see arguments, so an implicitly-read date
+    would have served results from a different search.
+    """
+    instance_count: int
+    duration_days: int
+    start_date: date
+    end_date: Optional[date] = None
+    target_resource: Optional[str] = None
+
+    @property
+    def duration_hours(self):
+        return int(self.duration_days * 24)
+
+    @property
+    def start_dt(self):
+        return datetime.combine(self.start_date, datetime.min.time())
+
+    @property
+    def end_dt(self):
+        return datetime.combine(self.end_date, datetime.min.time()) if self.end_date else None
+
+    def reduced(self):
+        """Same search with instance count and duration halved."""
+        return self._replace(
+            instance_count=max(1, self.instance_count // 2),
+            duration_days=max(1, self.duration_days // 2),
+        )
+
+
+def split_throttles(error_df):
+    """Partition an error frame into genuine errors and rate limits.
+
+    Returns (errors, throttles). A rate-limited region has not failed, it just
+    was not fully searched, and mixing the two makes a recoverable gap look like
+    a broken region.
+    """
+    if error_df.empty or "Full Error" not in error_df.columns:
+        return error_df, pd.DataFrame()
+    is_throttle = error_df["Full Error"].apply(is_throttle_error)
+    return error_df[~is_throttle], error_df[is_throttle]
+
 
 def process_results(results, expected_cols):
     """Split errors from results, sort by start date, and order columns cleanly"""
@@ -245,10 +352,24 @@ use_end_date = st.sidebar.checkbox("Specify End Date", value=False)
 end_date = st.sidebar.date_input("End Date", datetime.today() + timedelta(days=14), format="DD/MM/YYYY") if use_end_date else None
 
 selected_target_resource = st.sidebar.selectbox("SageMaker Target Resource", list(SAGEMAKER_TARGET_RESOURCES.keys()))
+force_fresh = st.sidebar.checkbox(
+    "Force fresh scan", value=False,
+    help=f"Identical searches are replayed from cache for {SCAN_CACHE_TTL_SECONDS}s to stay "
+         f"under the API rate limit. Tick this to call AWS regardless.")
 
 # ----------------- Validation -----------------
 if use_end_date and start_date > end_date:
     st.sidebar.error("Start date must be before end date.")
+
+# Every input that affects results, gathered once. target_resource is left off
+# here and filled in by the SageMaker branch, so changing that dropdown does not
+# invalidate a cached EC2 scan that never looked at it.
+search = SearchParams(
+    instance_count=instance_count,
+    duration_days=duration_days,
+    start_date=start_date,
+    end_date=end_date if use_end_date else None,
+)
 
 # ----------------- Rate Limiting -----------------
 class RegionLimiter:
@@ -307,36 +428,32 @@ class RegionLimiter:
             self._rate = min(self._max_rate, self._rate * 1.05)
 
 
-# Streamlit re-executes this script on every rerun, so module-level state is
-# discarded each time. Parking the registry in session_state lets a rate learned
-# during one scan carry over to the next click instead of resetting to optimistic.
-# The dict is fetched here, on the main thread, and passed to workers by
-# reference -- worker threads never touch session_state themselves.
-if "rate_limit_registry" not in st.session_state:
-    st.session_state["rate_limit_registry"] = {"limiters": {}, "lock": threading.Lock()}
-_LIMITERS = st.session_state["rate_limit_registry"]["limiters"]
-_LIMITERS_LOCK = st.session_state["rate_limit_registry"]["lock"]
-
-_client_lock = threading.Lock()
-
-
 def limiter_for(service, region):
-    """One limiter per service+region, since the quota is scoped that way."""
+    """One limiter per service+region, since the quota is scoped that way.
+
+    A rate learned during one scan carries over to the next click, rather than
+    resetting to optimistic every time the user presses the button again.
+    """
     key = (service, region)
-    with _LIMITERS_LOCK:
-        if key not in _LIMITERS:
-            _LIMITERS[key] = RegionLimiter()
-        return _LIMITERS[key]
+    with _RATE_LIMITERS_LOCK:
+        if key not in _RATE_LIMITERS:
+            _RATE_LIMITERS[key] = RegionLimiter()
+        return _RATE_LIMITERS[key]
 
 
 def make_client(service, region):
-    """Build a client under a lock.
+    """Return a cached client, building it under a lock on first use.
 
     boto3 clients are thread-safe once constructed, but constructing them from
-    the shared default session concurrently is not.
+    the shared default session concurrently is not. Reusing them also keeps the
+    connection pool warm and avoids re-resolving credentials on every scan;
+    clients refresh expiring credentials themselves, so holding one is safe.
     """
-    with _client_lock:
-        return boto3.client(service, region_name=region, config=BOTO_CONFIG)
+    key = (service, region)
+    with _CLIENTS_LOCK:
+        if key not in _CLIENTS:
+            _CLIENTS[key] = boto3.client(service, region_name=region, config=BOTO_CONFIG)
+        return _CLIENTS[key]
 
 
 def is_throttle_error(err):
@@ -408,18 +525,18 @@ def was_throttled(results):
 
 
 # ----------------- AWS EC2 Scan -----------------
-def scan_region_instance_type(ec2, region, itype, count, duration):
+def scan_region_instance_type(ec2, region, itype, search):
     try:
         params = {
             "InstanceType": itype,
-            "InstanceCount": int(count),
-            "CapacityDurationHours": int(duration * 24),
-            "StartDateRange": datetime.combine(start_date, datetime.min.time()),
+            "InstanceCount": int(search.instance_count),
+            "CapacityDurationHours": search.duration_hours,
+            "StartDateRange": search.start_dt,
             "AllAvailabilityZones": True,
             "MaxResults": 100
         }
-        if use_end_date and end_date:
-            params["EndDateRange"] = datetime.combine(end_date, datetime.min.time())
+        if search.end_dt:
+            params["EndDateRange"] = search.end_dt
         log_msg(f"EC2 params: {params}", region, itype)
 
         resp = throttled_call(
@@ -477,7 +594,7 @@ def scan_region_instance_type(ec2, region, itype, count, duration):
         return [{"Region": region, "Error": str(e)}]
 
 
-def scan_region(region, instance_types, count, duration):
+def scan_region(region, instance_types, search):
     """Scan one region for every requested instance type, one call at a time.
 
     Instance types are walked sequentially in this thread rather than fanned out,
@@ -497,7 +614,7 @@ def scan_region(region, instance_types, count, duration):
 
     results = []
     for itype in instance_types:
-        rows = scan_region_instance_type(ec2, region, itype, count, duration)
+        rows = scan_region_instance_type(ec2, region, itype, search)
         results.extend(rows)
         if was_throttled(rows):
             remaining = instance_types[instance_types.index(itype) + 1:]
@@ -507,17 +624,17 @@ def scan_region(region, instance_types, count, duration):
     return results
 
 # ----------------- SageMaker Scan -----------------
-def scan_sagemaker_instance_type(sm, region, itype, count, duration):
+def scan_sagemaker_instance_type(sm, region, itype, search):
     try:
         params = {
-            "TargetResources": [SAGEMAKER_TARGET_RESOURCES[selected_target_resource]],
+            "TargetResources": [SAGEMAKER_TARGET_RESOURCES[search.target_resource]],
             "InstanceType": f"ml.{itype}",
-            "InstanceCount": int(count),
-            "StartTimeAfter": datetime.combine(start_date, datetime.min.time()),
-            "DurationHours": int(duration * 24)
+            "InstanceCount": int(search.instance_count),
+            "StartTimeAfter": search.start_dt,
+            "DurationHours": search.duration_hours
         }
-        if use_end_date and end_date:
-            params["EndTimeBefore"] = datetime.combine(end_date, datetime.min.time())
+        if search.end_dt:
+            params["EndTimeBefore"] = search.end_dt
         log_msg(f"SageMaker params: {params}", region, itype)
 
         resp = throttled_call(
@@ -563,7 +680,7 @@ def scan_sagemaker_instance_type(sm, region, itype, count, duration):
         return [{"Region": region, "Error": str(e)}]
 
 
-def scan_sagemaker_region(region, instance_types, count, duration):
+def scan_sagemaker_region(region, instance_types, search):
     """SageMaker counterpart to scan_region: one region, types walked in order."""
     try:
         sm = make_client("sagemaker", region)
@@ -573,7 +690,7 @@ def scan_sagemaker_region(region, instance_types, count, duration):
 
     results = []
     for itype in instance_types:
-        rows = scan_sagemaker_instance_type(sm, region, itype, count, duration)
+        rows = scan_sagemaker_instance_type(sm, region, itype, search)
         results.extend(rows)
         if was_throttled(rows):
             remaining = instance_types[instance_types.index(itype) + 1:]
@@ -587,7 +704,7 @@ col1, col2, col3 = st.columns([1, 1, 4])
 with col1: do_capacity = st.button("Find EC2 Capacity Block")
 with col2: do_sagemaker = st.button("Find SageMaker Training Plan")
 
-def run_parallel(scan_fn, regions, instance_types, *args):
+def run_parallel(scan_fn, regions, instance_types, search):
     """Fan out one task per region.
 
     Previously this submitted one task per (region, instance_type) pair, which
@@ -600,17 +717,71 @@ def run_parallel(scan_fn, regions, instance_types, *args):
         return results
     workers = min(MAX_WORKERS, len(regions))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = [ex.submit(scan_fn, r, list(instance_types), *args) for r in regions]
+        futures = [ex.submit(scan_fn, r, list(instance_types), search) for r in regions]
         for f in concurrent.futures.as_completed(futures):
             results.extend(f.result())
     return results
+
+
+def run_scan(kind, scan_fn, regions, instance_types, search, force_fresh=False):
+    """Run a scan, replaying a recent identical one from cache instead.
+
+    Returns (results, age_seconds) where age_seconds is None for a fresh scan.
+    Without this, every button press and every reduced-parameter fallback was a
+    full set of API calls against a quota that refills slowly, so repeatedly
+    clicking Find was enough to throttle on its own.
+
+    A throttled scan is deliberately never cached: it is incomplete by
+    definition, and the user pressing Find again has to be able to fill the gap
+    rather than be handed the same one back.
+    """
+    key = (kind, tuple(regions), tuple(instance_types), search)
+    entry = _SCAN_CACHE.get(key)
+    now = time.monotonic()
+    if entry and not force_fresh and now - entry["at"] < SCAN_CACHE_TTL_SECONDS:
+        age = now - entry["at"]
+        log_msg(f"replaying cached {kind} scan from {age:.0f}s ago ({len(entry['results'])} row(s))")
+        return entry["results"], age
+
+    results = run_parallel(scan_fn, regions, instance_types, search)
+    if not was_throttled(results):
+        if len(_SCAN_CACHE) >= SCAN_CACHE_MAX_ENTRIES:
+            oldest = min(_SCAN_CACHE, key=lambda k: _SCAN_CACHE[k]["at"])
+            del _SCAN_CACHE[oldest]
+        _SCAN_CACHE[key] = {"at": now, "results": results}
+    return results, None
+
+
+def show_scan_issues(errors, throttles):
+    """Render rate limits and genuine errors as the separate things they are."""
+    if not throttles.empty:
+        st.warning(
+            "🚦 Rate limited in these region(s), so their coverage is incomplete. "
+            "Search again in a minute to fill the gaps:"
+        )
+        st.dataframe(throttles[["Region", "Error"]], width='stretch')
+    if not errors.empty:
+        st.warning("⚠️ Some regions returned errors:")
+        st.dataframe(errors, width='stretch')
+
+
+def show_cache_note(age):
+    """Say so when results are replayed, so cached data is never passed off as live."""
+    if age is None:
+        return
+    expires_in = max(0, SCAN_CACHE_TTL_SECONDS - int(age))
+    st.caption(
+        f"↻ Replayed from a scan {age:.0f}s ago, no API calls made. "
+        f"Expires in {expires_in}s, or tick \"Force fresh scan\" in the sidebar to re-run now."
+    )
 
 # EC2 capacity search
 if do_capacity:
     scan_regions = AWS_REGIONS if "All Regions" in selected_regions else selected_regions
     with st.spinner(f"Scanning {len(scan_regions)} region(s)..."):
-        results = run_parallel(scan_region, scan_regions, selected_instance_types, instance_count, duration_days)
+        results, age = run_scan("ec2", scan_region, scan_regions, selected_instance_types, search, force_fresh)
         success, errors = process_results(results, RESULT_COLS)
+        errors, throttles = split_throttles(errors)
         throttled = was_throttled(results)
         if success.empty and throttled:
             # Never launch the reduced-parameter pass off the back of a throttle.
@@ -625,11 +796,13 @@ if do_capacity:
             st.info("ℹ️ No capacity found. Retrying with reduced params...")
             # Same regions the user selected. The rate limiters carry their learned
             # rates over from the pass above, so this second wave stays paced.
-            reduced = run_parallel(scan_region, scan_regions, selected_instance_types, max(1,instance_count//2), max(1,duration_days//2))
+            reduced, reduced_age = run_scan(
+                "ec2", scan_region, scan_regions, selected_instance_types, search.reduced(), force_fresh)
             fallback, _ = process_results(reduced, RESULT_COLS)
             if not fallback.empty:
                 st.success("✅ Found alternatives with reduced parameters!")
                 st.dataframe(fallback, width='stretch', column_config=DATE_COL_CONFIG)
+                show_cache_note(reduced_age)
             elif was_throttled(reduced):
                 st.error("🚦 Request rate limit reached during the reduced-parameter retry. Wait a minute and try again.")
             else:
@@ -643,16 +816,18 @@ if do_capacity:
             else:
                 st.success("✅ Capacity blocks found!")
             st.dataframe(success, width='stretch', column_config=DATE_COL_CONFIG)
-        if not errors.empty:
-            st.warning("⚠️ Some regions returned errors:")
-            st.dataframe(errors, width='stretch')
+            show_cache_note(age)
+        show_scan_issues(errors, throttles)
 
 # SageMaker training plan
 if do_sagemaker:
     scan_regions = AWS_REGIONS if "All Regions" in selected_regions else selected_regions
+    sm_search = search._replace(target_resource=selected_target_resource)
     with st.spinner(f"Scanning SageMaker in {len(scan_regions)} region(s)..."):
-        results = run_parallel(scan_sagemaker_region, scan_regions, selected_instance_types, instance_count, duration_days)
+        results, age = run_scan(
+            "sagemaker", scan_sagemaker_region, scan_regions, selected_instance_types, sm_search, force_fresh)
         success, errors = process_results(results, RESULT_COLS)
+        errors, throttles = split_throttles(errors)
         throttled = was_throttled(results)
         if success.empty and throttled:
             st.error("🚦 Request rate limit reached. Wait a minute and search again, or narrow the regions and instance types.")
@@ -664,6 +839,5 @@ if do_sagemaker:
             else:
                 st.success("✅ SageMaker offerings found!")
             st.dataframe(success, width='stretch', column_config=DATE_COL_CONFIG)
-        if not errors.empty:
-            st.warning("⚠️ Some regions returned errors:")
-            st.dataframe(errors, width='stretch')
+            show_cache_note(age)
+        show_scan_issues(errors, throttles)
