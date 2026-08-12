@@ -111,6 +111,14 @@ RETRY_BASE_SECONDS = 2.0
 RETRY_CAP_SECONDS = 8.0
 RETRY_BUDGET_SECONDS = 30.0
 
+# DescribeCapacityBlockOfferings pagination. MaxResults accepts 1-1000, but 100
+# is left as-is because it is the value already proven against the live API;
+# pagination is what makes the result set complete, so page size only trades off
+# how many calls that takes. MAX_OFFERING_PAGES bounds the walk so a token that
+# never terminates cannot spin against a rate-limited quota.
+OFFERINGS_PAGE_SIZE = 100
+MAX_OFFERING_PAGES = 10
+
 # How long a completed scan may be replayed from cache, and how many distinct
 # searches to remember. Kept short on purpose: the aim is to absorb double
 # clicks and reruns, which is what actually burns the quota, without hiding
@@ -525,26 +533,67 @@ def was_throttled(results):
 
 
 # ----------------- AWS EC2 Scan -----------------
-def scan_region_instance_type(ec2, region, itype, search):
-    try:
-        params = {
-            "InstanceType": itype,
-            "InstanceCount": int(search.instance_count),
-            "CapacityDurationHours": search.duration_hours,
-            "StartDateRange": search.start_dt,
-            "AllAvailabilityZones": True,
-            "MaxResults": 100
-        }
-        if search.end_dt:
-            params["EndDateRange"] = search.end_dt
-        log_msg(f"EC2 params: {params}", region, itype)
+def describe_offerings_all_pages(ec2, region, itype, params):
+    """Walk every page of DescribeCapacityBlockOfferings.
 
-        resp = throttled_call(
-            "ec2", region,
-            lambda: ec2.describe_capacity_block_offerings(**params),
-            itype)
-        offerings = resp.get("CapacityBlockOfferings", [])
-        log_msg(f"EC2 offerings={len(offerings)}", region, itype)
+    Returns (offerings, error), where error is None on a clean run. The response
+    NextToken used to be dropped, so a region holding more offerings than one
+    page silently reported only the first and the rest looked like they did not
+    exist.
+
+    Paginated by hand rather than through ec2.get_paginator: a paginator issues
+    each page itself, which would bypass throttled_call and leave the extra calls
+    unpaced. Every page spends the same per-region quota as the first.
+
+    A throttle part-way through returns the pages already gathered alongside the
+    error, so partial coverage is reported as partial rather than thrown away.
+    """
+    offerings, token, pages = [], None, 0
+    while True:
+        page_params = dict(params)
+        if token:
+            page_params["NextToken"] = token
+        try:
+            resp = throttled_call(
+                "ec2", region,
+                lambda p=page_params: ec2.describe_capacity_block_offerings(**p),
+                itype)
+        except Exception as e:
+            log_msg(f"failed on page {pages + 1}, keeping {len(offerings)} offering(s): {e}", region, itype)
+            return offerings, e
+
+        offerings.extend(resp.get("CapacityBlockOfferings", []))
+        pages += 1
+        next_token = resp.get("NextToken")
+        if not next_token:
+            break
+        if pages >= MAX_OFFERING_PAGES:
+            log_msg(f"stopping at the {MAX_OFFERING_PAGES} page cap, more offerings remain", region, itype)
+            break
+        if next_token == token:
+            log_msg("NextToken did not advance, stopping rather than looping", region, itype)
+            break
+        token = next_token
+
+    log_msg(f"EC2 offerings={len(offerings)} across {pages} page(s)", region, itype)
+    return offerings, None
+
+
+def scan_region_instance_type(ec2, region, itype, search):
+    params = {
+        "InstanceType": itype,
+        "InstanceCount": int(search.instance_count),
+        "CapacityDurationHours": search.duration_hours,
+        "StartDateRange": search.start_dt,
+        "AllAvailabilityZones": True,
+        "MaxResults": OFFERINGS_PAGE_SIZE
+    }
+    if search.end_dt:
+        params["EndDateRange"] = search.end_dt
+    log_msg(f"EC2 params: {params}", region, itype)
+
+    offerings, error = describe_offerings_all_pages(ec2, region, itype, params)
+    try:
         results = []
         for o in offerings:
             upfront_fee = f"${o.get('UpfrontFee', '0')}"
@@ -588,10 +637,17 @@ def scan_region_instance_type(ec2, region, itype, search):
                     "Availability Zone": o.get("AvailabilityZone", "N/A"),
                     "Zone ID": get_az_zone_id(o.get("AvailabilityZone", "N/A"))
                 })
-        return results
     except Exception as e:
         log_msg(f"scan_region error: {e}", region, itype)
         return [{"Region": region, "Error": str(e)}]
+
+    if error is not None:
+        # Rows gathered before the failure are kept and the error travels with
+        # them, so a throttle on page 3 still shows pages 1 and 2 and is reported
+        # as incomplete coverage rather than as an empty region.
+        log_msg(f"scan_region error: {error}", region, itype)
+        results.append({"Region": region, "Error": str(error)})
+    return results
 
 
 def scan_region(region, instance_types, search):
