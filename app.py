@@ -50,7 +50,7 @@ AWS_REGIONS = [
     "us-west-1","us-west-2",
     "eu-north-1","eu-west-2","eu-south-2",
     "ap-northeast-1","ap-northeast-2",
-    "ap-south-1",
+    "ap-south-1","ap-south-2",
     "ap-southeast-2","ap-southeast-3", "ap-southeast-4",
     "sa-east-1"
 ]
@@ -63,7 +63,8 @@ REGION_LABEL = {
     "us-west-1": "N. California", "us-west-2": "Oregon",
     "eu-north-1": "Stockholm", "eu-west-2": "London", "eu-south-2": "Spain",
     "ap-northeast-1": "Tokyo", "ap-northeast-2": "Seoul",
-    "ap-south-1": "Mumbai", "ap-southeast-2": "Sydney",
+    "ap-south-1": "Mumbai", "ap-south-2": "Hyderabad",
+    "ap-southeast-2": "Sydney",
     "ap-southeast-3": "Jakarta", "ap-southeast-4": "Melbourne",
     "sa-east-1": "São Paulo",
 }
@@ -193,7 +194,8 @@ RESULT_COLS = [
 # ----------------- Sidebar Inputs -----------------
 st.sidebar.header("Search Parameters")
 selected_instance_types = st.sidebar.multiselect("Select Instance Types", INSTANCE_TYPES, default=["p5.48xlarge"])
-instance_count = st.sidebar.number_input("Instance Count", min_value=1, max_value=256, value=1)
+# Max 64 instances per Capacity Block (256 is the account-wide total across blocks).
+instance_count = st.sidebar.number_input("Instance Count", min_value=1, max_value=64, value=1)
 
 region_options = ["All Regions"] + AWS_REGIONS
 selected_regions = st.sidebar.multiselect(
