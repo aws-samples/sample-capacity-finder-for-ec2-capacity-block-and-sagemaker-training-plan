@@ -48,7 +48,7 @@ INSTANCE_TYPES = [
 AWS_REGIONS = [
     "us-east-1","us-east-2",
     "us-west-1","us-west-2",
-    "eu-north-1","eu-west-2","eu-south-2",
+    "eu-north-1","eu-west-2","eu-west-3","eu-south-2",
     "ap-northeast-1","ap-northeast-2",
     "ap-south-1","ap-south-2",
     "ap-southeast-2","ap-southeast-3", "ap-southeast-4",
@@ -61,7 +61,7 @@ VALID_DURATIONS = [1,2,3,4,5,6,7,8,9,10,11,12,13,14] + [i for i in range(21,183,
 REGION_LABEL = {
     "us-east-1": "N. Virginia", "us-east-2": "Ohio",
     "us-west-1": "N. California", "us-west-2": "Oregon",
-    "eu-north-1": "Stockholm", "eu-west-2": "London", "eu-south-2": "Spain",
+    "eu-north-1": "Stockholm", "eu-west-2": "London", "eu-west-3": "Paris", "eu-south-2": "Spain",
     "ap-northeast-1": "Tokyo", "ap-northeast-2": "Seoul",
     "ap-south-1": "Mumbai", "ap-south-2": "Hyderabad",
     "ap-southeast-2": "Sydney",
