@@ -13,13 +13,15 @@
 
 This is a single-file Streamlit app. Run it directly with:
 ```bash
-uvx --with boto3==1.43.36 --with pandas==2.3.2 --with numpy==2.3.5 --with pyarrow==21.0.0 --from streamlit==1.54.0 streamlit run https://raw.githubusercontent.com/aws-samples/sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan/main/app.py
+uvx --python 3.13 --with boto3==1.43.36 --with pandas==2.3.2 --with numpy==2.3.5 --with pyarrow==21.0.0 --from streamlit==1.54.0 streamlit run https://raw.githubusercontent.com/aws-samples/sample-capacity-finder-for-ec2-capacity-block-and-sagemaker-training-plan/main/app.py
 ```
 
 Prerequisites:
 - [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed (provides the `uvx` command)
 - AWS credentials configured (e.g. `aws configure`, or `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` env vars)
 - AWS IAM permissions: `ec2:DescribeCapacityBlockOfferings`, `ec2:DescribeAvailabilityZones`, `sagemaker:SearchTrainingPlanOfferings`
+
+`--python 3.13` is required: without it `uvx` picks whichever interpreter it finds, and on machines with several Python versions installed it can mix cached wheels built for different versions into one environment, which fails with errors like `ModuleNotFoundError: No module named 'pandas._libs.pandas_parser'`. `uv` downloads Python 3.13 automatically if you do not have it. If you hit that error from an earlier run, add `--refresh` once to rebuild the cached environment.
 
 ## Quick Start
 
