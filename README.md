@@ -2,6 +2,8 @@
 
 🔎 A Streamlit app for exploring available AWS [EC2 Capacity Blocks](https://aws.amazon.com/ec2/capacityblocks/) and [SageMaker Training Plans](https://docs.aws.amazon.com/sagemaker/latest/dg/reserve-capacity-with-training-plans.html) across regions and instance types.
 
+> **Using Claude Code, Kiro, or a similar coding agent?** Try the [GPU Capacity Finder Agent Skill](https://github.com/aws-samples/sample-apj-sup-sa/tree/feat/gpu-capacity-finder-skill/ai-infra/gpu-capacity-finder-skill) instead — a conversational alternative to this web app, same underlying APIs. Maintained in that repo, not duplicated here.
+
 <img src="./assets/app-screenshot.png" alt="App Screenshot" width="1000">
 
 
