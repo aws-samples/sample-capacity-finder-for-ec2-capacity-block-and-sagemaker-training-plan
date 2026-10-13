@@ -2,4 +2,4 @@ streamlit==1.54.0
 boto3==1.43.36
 pandas==2.3.2
 numpy==2.3.5
-pyarrow==21.0.0
+pyarrow==23.0.1
