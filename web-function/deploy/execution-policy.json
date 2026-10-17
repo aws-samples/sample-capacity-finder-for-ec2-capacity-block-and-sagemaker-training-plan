@@ -1,0 +1,22 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadCapacityOfferings",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeCapacityBlockOfferings",
+        "ec2:DescribeRegions",
+        "sagemaker:SearchTrainingPlanOfferings"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadApplicationPassword",
+      "Effect": "Allow",
+      "Action": "secretsmanager:GetSecretValue",
+      "Resource": "arn:aws:secretsmanager:REGION:ACCOUNT_ID:secret:capacity-finder/app-auth-*"
+    }
+  ]
+}

@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>EC2 Capacity Block and SageMaker Training Plan Finder</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="page-header">
+    <div class="header-inner">
+      <p class="eyebrow">AWS capacity planning</p>
+      <h1>EC2 Capacity Block and SageMaker Training Plan Finder</h1>
+      <p class="subtitle">Search current offerings across instance types and AWS Regions without opening seventeen console tabs.</p>
+    </div>
+  </header>
+
+  <main>
+    <section class="search-card" aria-labelledby="search-heading">
+      <div class="section-heading">
+        <div>
+          <p class="step">Search</p>
+          <h2 id="search-heading">Choose capacity requirements</h2>
+        </div>
+        <div class="service-switch" role="group" aria-label="Capacity service">
+          <button type="button" class="service-button active" data-service="ec2">EC2 Capacity Blocks</button>
+          <button type="button" class="service-button" data-service="sagemaker">SageMaker Training Plans</button>
+        </div>
+      </div>
+
+      <form id="search-form">
+        <div class="form-grid">
+          <label class="field field-wide">
+            <span>Instance types</span>
+            <select id="instance-types" multiple size="7" required></select>
+            <small>Use Command or Control to select more than one.</small>
+          </label>
+
+          <label class="field field-wide">
+            <span>AWS Regions</span>
+            <select id="regions" multiple size="7" required></select>
+            <small>Select only the Regions the workload can use to keep searches quick.</small>
+          </label>
+
+          <label class="field">
+            <span>Instance count</span>
+            <input id="instance-count" type="number" min="1" max="64" value="1" required>
+          </label>
+
+          <label class="field">
+            <span>Duration</span>
+            <select id="duration" required></select>
+          </label>
+
+          <label class="field">
+            <span>Start date</span>
+            <input id="start-date" type="date" required>
+          </label>
+
+          <label class="field">
+            <span>End date <em>optional</em></span>
+            <input id="end-date" type="date">
+          </label>
+
+          <label class="field field-wide" id="target-resource-field" hidden>
+            <span>SageMaker target resource</span>
+            <select id="target-resource"></select>
+          </label>
+
+          <label class="field field-wide" id="password-field" hidden>
+            <span>Application password</span>
+            <input id="app-password" type="password" autocomplete="current-password">
+            <small>The password stays in this browser tab and is sent only with search requests.</small>
+          </label>
+        </div>
+
+        <div class="form-actions">
+          <p id="search-summary">Ready to search.</p>
+          <button class="primary-button" type="submit">Find offerings</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="results-card" aria-labelledby="results-heading">
+      <div class="section-heading">
+        <div>
+          <p class="step">Results</p>
+          <h2 id="results-heading">Available offerings</h2>
+        </div>
+        <div class="export-actions">
+          <button type="button" id="export-json" disabled>Export JSON</button>
+          <button type="button" id="export-csv" disabled>Export CSV</button>
+        </div>
+      </div>
+      <div id="status" class="status neutral">Run a search to see offerings.</div>
+      <div class="table-wrap">
+        <table id="results-table">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <details id="errors-panel" hidden>
+        <summary>Some searches returned errors</summary>
+        <div id="errors-list"></div>
+      </details>
+    </section>
+  </main>
+
+  <footer>
+    Offering data changes continuously. Confirm availability before committing capacity to a customer.
+  </footer>
+</body>
+</html>
