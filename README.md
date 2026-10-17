@@ -54,6 +54,26 @@ Prerequisites:
    streamlit run app.py
    ```
 
+## Lambda Web Functions
+
+The `web-function/` directory contains a Node.js 24 port for AWS Lambda Web
+Functions. It keeps AWS API calls server-side and serves a responsive browser
+interface from the same deployment. The region selector is discovered at
+runtime, so Regions that are not enabled for the deployment account are hidden.
+
+```bash
+cd web-function
+npm install
+npm test
+npm start
+```
+
+Open `http://localhost:3000`. Deployment requires the official
+`aws-lambda-web-functions` Skill, an execution role with the four IAM
+permissions listed below, and a deliberate endpoint auth choice.
+Replace `REGION` and `ACCOUNT_ID` in
+`web-function/deploy/execution-policy.json` before applying the policy.
+
 ## Additional
 - (Optional) Create and activate a virtual environment:
 ```
@@ -70,6 +90,7 @@ source venv/bin/activate
       "Action": [
         "ec2:DescribeCapacityBlockOfferings",
         "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeRegions",
         "sagemaker:SearchTrainingPlanOfferings"
       ],
       "Resource": "*"
