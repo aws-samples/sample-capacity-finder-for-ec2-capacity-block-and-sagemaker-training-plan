@@ -1,5 +1,10 @@
 # AWS EC2 Capacity Blocks and SageMaker Training Plans Finder
 
+> [!IMPORTANT]
+> Since November 2026, the Amazon EC2 console supports [searching Capacity Blocks for ML across multiple instance types and AWS Regions](https://aws.amazon.com/about-aws/whats-new/2026/11/ec2-capacity-blocks-ml-flex-search/) in a single search.
+> If you only need EC2 Capacity Blocks, the [EC2 console](https://console.aws.amazon.com/ec2/home#CreateCapacityBlockReservation:) is the simplest option.
+> This sample supports both EC2 Capacity Blocks and SageMaker Training Plans.
+
 🔎 A Streamlit app for exploring available AWS [EC2 Capacity Blocks](https://aws.amazon.com/ec2/capacityblocks/) and [SageMaker Training Plans](https://docs.aws.amazon.com/sagemaker/latest/dg/reserve-capacity-with-training-plans.html) across regions and instance types.
 
 <img src="./assets/app-screenshot.png" alt="App Screenshot" width="1000">
